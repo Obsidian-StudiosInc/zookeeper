@@ -18,8 +18,6 @@
 
 package org.apache.zookeeper.server;
 
-import static org.jboss.netty.buffer.ChannelBuffers.wrappedBuffer;
-
 import java.io.BufferedWriter;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -43,19 +41,18 @@ import org.apache.zookeeper.server.command.CommandExecutor;
 import org.apache.zookeeper.server.command.FourLetterCommands;
 import org.apache.zookeeper.server.command.NopCommand;
 import org.apache.zookeeper.server.command.SetTraceMaskCommand;
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelFuture;
-import org.jboss.netty.channel.ChannelFutureListener;
-import org.jboss.netty.channel.MessageEvent;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class NettyServerCnxn extends ServerCnxn {
     private static final Logger LOG = LoggerFactory.getLogger(NettyServerCnxn.class);
     Channel channel;
-    ChannelBuffer queuedBuffer;
+    ByteBuf queuedBuffer;
     volatile boolean throttled;
     ByteBuffer bb;
     ByteBuffer bbLen = ByteBuffer.allocate(4);
@@ -114,7 +111,7 @@ public class NettyServerCnxn extends ServerCnxn {
             synchronized (factory.ipMap) {
                 Set<NettyServerCnxn> s =
                     factory.ipMap.get(((InetSocketAddress)channel
-                            .getRemoteAddress()).getAddress());
+                            .remoteAddress()).getAddress());
                 s.remove(this);
             }
         }
@@ -161,18 +158,14 @@ public class NettyServerCnxn extends ServerCnxn {
     }
 
     private static final byte[] fourBytes = new byte[4];
-    static class ResumeMessageEvent implements MessageEvent {
+    static class ResumeMessageEvent {
         Channel channel;
         ResumeMessageEvent(Channel channel) {
             this.channel = channel;
         }
-        @Override
         public Object getMessage() {return null;}
-        @Override
         public SocketAddress getRemoteAddress() {return null;}
-        @Override
         public Channel getChannel() {return channel;}
-        @Override
         public ChannelFuture getFuture() {return null;}
     };
     
@@ -219,7 +212,7 @@ public class NettyServerCnxn extends ServerCnxn {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Sending unthrottle event " + this);
             }
-            channel.getPipeline().sendUpstream(new ResumeMessageEvent(channel));
+            channel.pipeline().fireChannelRead(new ResumeMessageEvent(channel));
         }
     }
 
@@ -229,7 +222,7 @@ public class NettyServerCnxn extends ServerCnxn {
             close();
             return;
         }
-        channel.write(wrappedBuffer(sendBuffer));
+        channel.write(Unpooled.wrappedBuffer(sendBuffer));
         packetSent();
     }
 
@@ -277,7 +270,7 @@ public class NettyServerCnxn extends ServerCnxn {
 
     /** Return if four letter word found and responded to, otw false **/
     private boolean checkFourLetterWord(final Channel channel,
-            ChannelBuffer message, final int len) throws IOException
+            ByteBuf message, final int len) throws IOException
     {
         // We take advantage of the limited size of the length to look
         // for cmds. They are all 4-bytes which fits inside of an int
@@ -288,6 +281,8 @@ public class NettyServerCnxn extends ServerCnxn {
         String cmd = FourLetterCommands.getCommandString(len);
 
         channel.setInterestOps(0).awaitUninterruptibly();
+        LOG.info("Processing " + cmd + " command from "
+                + channel.remoteAddress());
         packetReceived();
 
         final PrintWriter pwriter = new PrintWriter(
@@ -320,9 +315,9 @@ public class NettyServerCnxn extends ServerCnxn {
         }
     }
 
-    public void receiveMessage(ChannelBuffer message) {
+    public void receiveMessage(ByteBuf message) {
         try {
-            while(message.readable() && !throttled) {
+            while(message.isReadable() && !throttled) {
                 if (bb != null) {
                     if (LOG.isTraceEnabled()) {
                         LOG.trace("message readable " + message.readableBytes()
@@ -331,8 +326,8 @@ public class NettyServerCnxn extends ServerCnxn {
                         dat.flip();
                         LOG.trace(Long.toHexString(sessionId)
                                 + " bb 0x"
-                                + ChannelBuffers.hexDump(
-                                        ChannelBuffers.copiedBuffer(dat)));
+                                + ByteBufUtil.hexDump(
+                                        Unpooled.copiedBuffer(dat)));
                     }
 
                     if (bb.remaining() > message.readableBytes()) {
@@ -351,8 +346,8 @@ public class NettyServerCnxn extends ServerCnxn {
                         LOG.trace("after readbytes "
                                 + Long.toHexString(sessionId)
                                 + " bb 0x"
-                                + ChannelBuffers.hexDump(
-                                        ChannelBuffers.copiedBuffer(dat)));
+                                + ByteBufUtil.hexDump(
+                                        Unpooled.copiedBuffer(dat)));
                     }
                     if (bb.remaining() == 0) {
                         packetReceived();
@@ -385,8 +380,8 @@ public class NettyServerCnxn extends ServerCnxn {
                         dat.flip();
                         LOG.trace(Long.toHexString(sessionId)
                                 + " bbLen 0x"
-                                + ChannelBuffers.hexDump(
-                                        ChannelBuffers.copiedBuffer(dat)));
+                                + ByteBufUtil.hexDump(
+                                        Unpooled.copiedBuffer(dat)));
                     }
 
                     if (message.readableBytes() < bbLen.remaining()) {
@@ -400,8 +395,8 @@ public class NettyServerCnxn extends ServerCnxn {
                         if (LOG.isTraceEnabled()) {
                             LOG.trace(Long.toHexString(sessionId)
                                     + " bbLen 0x"
-                                    + ChannelBuffers.hexDump(
-                                            ChannelBuffers.copiedBuffer(bbLen)));
+                                    + ByteBufUtil.hexDump(
+                                            Unpooled.copiedBuffer(bbLen)));
                         }
                         int len = bbLen.getInt();
                         if (LOG.isTraceEnabled()) {
@@ -458,7 +453,7 @@ public class NettyServerCnxn extends ServerCnxn {
 
     @Override
     public InetSocketAddress getRemoteSocketAddress() {
-        return (InetSocketAddress)channel.getRemoteAddress();
+        return (InetSocketAddress)channel.remoteAddress();
     }
 
     /** Send close connection packet to the client.

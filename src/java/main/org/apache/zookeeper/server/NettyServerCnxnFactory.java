@@ -18,8 +18,6 @@
 
 package org.apache.zookeeper.server;
 
-import static org.jboss.netty.buffer.ChannelBuffers.dynamicBuffer;
-
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -29,7 +27,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.Executors;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -45,26 +42,24 @@ import org.apache.zookeeper.common.X509Exception.SSLContextException;
 import org.apache.zookeeper.common.X509Util;
 import org.apache.zookeeper.server.auth.ProviderRegistry;
 import org.apache.zookeeper.server.auth.X509AuthenticationProvider;
-import org.jboss.netty.bootstrap.ServerBootstrap;
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelFuture;
-import org.jboss.netty.channel.ChannelFutureListener;
-import org.jboss.netty.channel.ChannelHandler.Sharable;
-import org.jboss.netty.channel.ChannelHandlerContext;
-import org.jboss.netty.channel.ChannelPipeline;
-import org.jboss.netty.channel.ChannelPipelineFactory;
-import org.jboss.netty.channel.ChannelStateEvent;
-import org.jboss.netty.channel.Channels;
-import org.jboss.netty.channel.ExceptionEvent;
-import org.jboss.netty.channel.MessageEvent;
-import org.jboss.netty.channel.SimpleChannelHandler;
-import org.jboss.netty.channel.WriteCompletionEvent;
-import org.jboss.netty.channel.group.ChannelGroup;
-import org.jboss.netty.channel.group.DefaultChannelGroup;
-import org.jboss.netty.channel.socket.nio.NioServerSocketChannelFactory;
-import org.jboss.netty.handler.ssl.SslHandler;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandler.Sharable;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandler;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.ssl.SslHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -80,66 +75,60 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
     int maxClientCnxns = 60;
 
     /**
-     * This is an inner class since we need to extend SimpleChannelHandler, but
+     * This is an inner class since we need to extend ChannelInboundHandler, but
      * NettyServerCnxnFactory already extends ServerCnxnFactory. By making it inner
      * this class gets access to the member variables and methods.
      */
     @Sharable
-    class CnxnChannelHandler extends SimpleChannelHandler {
-
-        @Override
-        public void channelClosed(ChannelHandlerContext ctx, ChannelStateEvent e)
+    class CnxnChannelHandler implements ChannelInboundHandler {
+        
+        public void channelInactive(ChannelHandlerContext ctx)
             throws Exception
         {
             if (LOG.isTraceEnabled()) {
-                LOG.trace("Channel closed " + e);
+                LOG.trace("Channel closed " + ctx.name());
             }
-            allChannels.remove(ctx.getChannel());
+            allChannels.remove(ctx.channel());
         }
 
-        @Override
-        public void channelConnected(ChannelHandlerContext ctx,
-                ChannelStateEvent e) throws Exception
+        public void channelActive(ChannelHandlerContext ctx) throws Exception
         {
             if (LOG.isTraceEnabled()) {
-                LOG.trace("Channel connected " + e);
+                LOG.trace("Channel connected " + ctx.name());
             }
 
-            NettyServerCnxn cnxn = new NettyServerCnxn(ctx.getChannel(),
+            NettyServerCnxn cnxn = new NettyServerCnxn(ctx.channel(),
                     zkServer, NettyServerCnxnFactory.this);
             ctx.setAttachment(cnxn);
 
             if (secure) {
-                SslHandler sslHandler = ctx.getPipeline().get(SslHandler.class);
+                SslHandler sslHandler = ctx.pipeline().get(SslHandler.class);
                 ChannelFuture handshakeFuture = sslHandler.handshake();
                 handshakeFuture.addListener(new CertificateVerifier(sslHandler, cnxn));
             } else {
-                allChannels.add(ctx.getChannel());
+                allChannels.add(ctx.channel());
                 addCnxn(cnxn);
             }
         }
 
-        @Override
-        public void channelDisconnected(ChannelHandlerContext ctx,
-                ChannelStateEvent e) throws Exception
+        public void channelUnregistered(ChannelHandlerContext ctx) throws Exception
         {
             if (LOG.isTraceEnabled()) {
-                LOG.trace("Channel disconnected " + e);
+                LOG.trace("Channel disconnected " + ctx.name());
             }
             NettyServerCnxn cnxn = (NettyServerCnxn) ctx.getAttachment();
             if (cnxn != null) {
                 if (LOG.isTraceEnabled()) {
-                    LOG.trace("Channel disconnect caused close " + e);
+                    LOG.trace("Channel disconnect caused close " + ctx.name());
                 }
                 cnxn.close();
             }
         }
 
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, ExceptionEvent e)
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause)
             throws Exception
         {
-            LOG.warn("Exception caught " + e, e.getCause());
+            LOG.warn("Exception caught " + cause.getMessage(), cause);
             NettyServerCnxn cnxn = (NettyServerCnxn) ctx.getAttachment();
             if (cnxn != null) {
                 if (LOG.isDebugEnabled()) {
@@ -149,21 +138,20 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
             }
         }
 
-        @Override
-        public void messageReceived(ChannelHandlerContext ctx, MessageEvent e)
+        public void channelRead(ChannelHandlerContext ctx, Object message)
             throws Exception
         {
             if (LOG.isTraceEnabled()) {
-                LOG.trace("message received called " + e.getMessage());
+                LOG.trace("message received called " + message);
             }
             try {
                 if (LOG.isDebugEnabled()) {
-                    LOG.debug("New message " + e.toString()
-                            + " from " + ctx.getChannel());
+                    LOG.debug("New message " + message
+                            + " from " + ctx.channel());
                 }
                 NettyServerCnxn cnxn = (NettyServerCnxn)ctx.getAttachment();
                 synchronized(cnxn) {
-                    processMessage(e, cnxn);
+                    processMessage(message, cnxn);
                 }
             } catch(Exception ex) {
                 LOG.error("Unexpected exception in receive", ex);
@@ -171,23 +159,23 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
             }
         }
 
-        private void processMessage(MessageEvent e, NettyServerCnxn cnxn) {
+        private void processMessage(Object message, NettyServerCnxn cnxn) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug(Long.toHexString(cnxn.sessionId) + " queuedBuffer: "
                         + cnxn.queuedBuffer);
             }
 
-            if (e instanceof NettyServerCnxn.ResumeMessageEvent) {
+            if (message instanceof NettyServerCnxn.ResumeMessageEvent) {
                 LOG.debug("Received ResumeMessageEvent");
                 if (cnxn.queuedBuffer != null) {
                     if (LOG.isTraceEnabled()) {
                         LOG.trace("processing queue "
                                 + Long.toHexString(cnxn.sessionId)
                                 + " queuedBuffer 0x"
-                                + ChannelBuffers.hexDump(cnxn.queuedBuffer));
+                                + ByteBufUtil.hexDump(cnxn.queuedBuffer));
                     }
                     cnxn.receiveMessage(cnxn.queuedBuffer);
-                    if (!cnxn.queuedBuffer.readable()) {
+                    if (!cnxn.queuedBuffer.isReadable()) {
                         LOG.debug("Processed queue - no bytes remaining");
                         cnxn.queuedBuffer = null;
                     } else {
@@ -198,11 +186,11 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
                 }
                 cnxn.channel.setReadable(true);
             } else {
-                ChannelBuffer buf = (ChannelBuffer)e.getMessage();
+                ByteBuf buf = (ByteBuf)message;
                 if (LOG.isTraceEnabled()) {
                     LOG.trace(Long.toHexString(cnxn.sessionId)
                             + " buf 0x"
-                            + ChannelBuffers.hexDump(buf));
+                            + ByteBufUtil.hexDump(buf));
                 }
                 
                 if (cnxn.throttled) {
@@ -210,13 +198,13 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
                     // we are throttled, so we need to queue
                     if (cnxn.queuedBuffer == null) {
                         LOG.debug("allocating queue");
-                        cnxn.queuedBuffer = dynamicBuffer(buf.readableBytes());
+                        cnxn.queuedBuffer = Unpooled.buffer(buf.readableBytes());
                     }
                     cnxn.queuedBuffer.writeBytes(buf);
                     if (LOG.isTraceEnabled()) {
                         LOG.trace(Long.toHexString(cnxn.sessionId)
                                 + " queuedBuffer 0x"
-                                + ChannelBuffers.hexDump(cnxn.queuedBuffer));
+                                + ByteBufUtil.hexDump(cnxn.queuedBuffer));
                     }
                 } else {
                     LOG.debug("not throttled");
@@ -224,17 +212,17 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
                         if (LOG.isTraceEnabled()) {
                             LOG.trace(Long.toHexString(cnxn.sessionId)
                                     + " queuedBuffer 0x"
-                                    + ChannelBuffers.hexDump(cnxn.queuedBuffer));
+                                    + ByteBufUtil.hexDump(cnxn.queuedBuffer));
                         }
                         cnxn.queuedBuffer.writeBytes(buf);
                         if (LOG.isTraceEnabled()) {
                             LOG.trace(Long.toHexString(cnxn.sessionId)
                                     + " queuedBuffer 0x"
-                                    + ChannelBuffers.hexDump(cnxn.queuedBuffer));
+                                    + ByteBufUtil.hexDump(cnxn.queuedBuffer));
                         }
 
                         cnxn.receiveMessage(cnxn.queuedBuffer);
-                        if (!cnxn.queuedBuffer.readable()) {
+                        if (!cnxn.queuedBuffer.isReadable()) {
                             LOG.debug("Processed queue - no bytes remaining");
                             cnxn.queuedBuffer = null;
                         } else {
@@ -242,17 +230,17 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
                         }
                     } else {
                         cnxn.receiveMessage(buf);
-                        if (buf.readable()) {
+                        if (buf.isReadable()) {
                             if (LOG.isTraceEnabled()) {
                                 LOG.trace("Before copy " + buf);
                             }
-                            cnxn.queuedBuffer = dynamicBuffer(buf.readableBytes()); 
+                            cnxn.queuedBuffer = Unpooled.buffer(buf.readableBytes()); 
                             cnxn.queuedBuffer.writeBytes(buf);
                             if (LOG.isTraceEnabled()) {
                                 LOG.trace("Copy is " + cnxn.queuedBuffer);
                                 LOG.trace(Long.toHexString(cnxn.sessionId)
                                         + " queuedBuffer 0x"
-                                        + ChannelBuffers.hexDump(cnxn.queuedBuffer));
+                                        + ByteBufUtil.hexDump(cnxn.queuedBuffer));
                             }
                         }
                     }
@@ -260,12 +248,11 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
             }
         }
 
-        @Override
-        public void writeComplete(ChannelHandlerContext ctx,
-                WriteCompletionEvent e) throws Exception
+        public void channelReadComplete(ChannelHandlerContext ctx,
+                Object message) throws Exception
         {
             if (LOG.isTraceEnabled()) {
-                LOG.trace("write complete " + e);
+                LOG.trace("write complete " + message);
             }
         }
 
@@ -312,7 +299,7 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
                         return;
                     }
 
-                    allChannels.add(future.getChannel());
+                    allChannels.add(future.channel());
                     addCnxn(cnxn);
                 } else {
                     LOG.error("Unsuccessful handshake with session 0x{}",
@@ -326,26 +313,28 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
     CnxnChannelHandler channelHandler = new CnxnChannelHandler();
 
     NettyServerCnxnFactory() {
-        bootstrap = new ServerBootstrap(
-                new NioServerSocketChannelFactory(
-                        Executors.newCachedThreadPool(),
-                        Executors.newCachedThreadPool()));
+        
+//        bootstrap = new ServerBootstrap(
+//                new NioServerSocketChannelFactory(
+//                        Executors.newCachedThreadPool(),
+//                        Executors.newCachedThreadPool()));
+        
+        bootstrap = new ServerBootstrap();
         // parent channel
-        bootstrap.setOption("reuseAddress", true);
+        bootstrap.channel(NioServerSocketChannel.class);
+        bootstrap.option(ChannelOption.SO_REUSEADDR,true);
         // child channels
-        bootstrap.setOption("child.tcpNoDelay", true);
+        bootstrap.childOption(ChannelOption.TCP_NODELAY,true);
         /* set socket linger to off, so that socket close does not block */
-        bootstrap.setOption("child.soLinger", -1);
-        bootstrap.setPipelineFactory(new ChannelPipelineFactory() {
+        bootstrap.childOption(ChannelOption.SO_LINGER,-1);
+        bootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
             @Override
-            public ChannelPipeline getPipeline() throws Exception {
-                ChannelPipeline p = Channels.pipeline();
+            public void initChannel(SocketChannel ch) throws Exception {
+                ChannelPipeline p = ch.pipeline();
                 if (secure) {
                     initSSL(p);
                 }
                 p.addLast("servercnxnfactory", channelHandler);
-
-                return p;
             }
         });
     }
@@ -381,7 +370,7 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
         sslEngine.setNeedClientAuth(true);
 
         p.addLast("ssl", new SslHandler(sslEngine));
-        LOG.info("SSL handler added for channel: {}", p.getChannel());
+        LOG.info("SSL handler added for channel: {}", p.channel());
     }
 
     @Override
@@ -485,20 +474,15 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
     @Override
     public void start() {
         LOG.info("binding to port " + localAddress);
-        parentChannel = bootstrap.bind(localAddress);
+        parentChannel = bootstrap.bind(localAddress).channel();
     }
     
     public void reconfigure(InetSocketAddress addr) {
        Channel oldChannel = parentChannel;
-       try {
-           LOG.info("binding to port {}", addr);
-           parentChannel = bootstrap.bind(addr);
-           localAddress = addr;
-       } catch (Exception e) {
-           LOG.error("Error while reconfiguring", e);
-       } finally {
-           oldChannel.close();
-       }
+       LOG.info("binding to port " + addr);
+        parentChannel = bootstrap.bind(addr).channel();
+        localAddress = addr;  
+        oldChannel.close();
     }
     
     @Override
@@ -526,7 +510,7 @@ public class NettyServerCnxnFactory extends ServerCnxnFactory {
         cnxns.add(cnxn);
         synchronized (ipMap){
             InetAddress addr =
-                ((InetSocketAddress)cnxn.channel.getRemoteAddress())
+                ((InetSocketAddress)cnxn.channel.remoteAddress())
                     .getAddress();
             Set<NettyServerCnxn> s = ipMap.get(addr);
             if (s == null) {

@@ -22,23 +22,22 @@ import org.apache.zookeeper.ClientCnxn.EndOfStreamException;
 import org.apache.zookeeper.ClientCnxn.Packet;
 import org.apache.zookeeper.client.ZKClientConfig;
 import org.apache.zookeeper.common.X509Util;
-import org.jboss.netty.bootstrap.ClientBootstrap;
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelFactory;
-import org.jboss.netty.channel.ChannelFuture;
-import org.jboss.netty.channel.ChannelFutureListener;
-import org.jboss.netty.channel.ChannelHandlerContext;
-import org.jboss.netty.channel.ChannelPipeline;
-import org.jboss.netty.channel.ChannelPipelineFactory;
-import org.jboss.netty.channel.ChannelStateEvent;
-import org.jboss.netty.channel.Channels;
-import org.jboss.netty.channel.ExceptionEvent;
-import org.jboss.netty.channel.MessageEvent;
-import org.jboss.netty.channel.SimpleChannelUpstreamHandler;
-import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
-import org.jboss.netty.handler.ssl.SslHandler;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioSocketChannel;
+//import io.netty.handler.codec.ByteToMessageDecoder; // Used at compile time
+import io.netty.handler.ssl.SslHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,7 +50,6 @@ import java.net.SocketAddress;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -68,8 +66,7 @@ import static org.apache.zookeeper.common.X509Exception.SSLContextException;
 public class ClientCnxnSocketNetty extends ClientCnxnSocket {
     private static final Logger LOG = LoggerFactory.getLogger(ClientCnxnSocketNetty.class);
 
-    ChannelFactory channelFactory = new NioClientSocketChannelFactory(
-            Executors.newCachedThreadPool(), Executors.newCachedThreadPool());
+    EventLoopGroup workerGroup = new NioEventLoopGroup();
     Channel channel;
     CountDownLatch firstConnect;
     ChannelFuture connectFuture;
@@ -110,11 +107,12 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
     void connect(InetSocketAddress addr) throws IOException {
         firstConnect = new CountDownLatch(1);
 
-        ClientBootstrap bootstrap = new ClientBootstrap(channelFactory);
-
-        bootstrap.setPipelineFactory(new ZKClientPipelineFactory(addr.getHostString(), addr.getPort()));
-        bootstrap.setOption("soLinger", -1);
-        bootstrap.setOption("tcpNoDelay", true);
+        Bootstrap bootstrap = new Bootstrap();
+        bootstrap.group(workerGroup);
+        bootstrap.channel(NioSocketChannel.class);
+        bootstrap.option(ChannelOption.SO_LINGER,-1);
+        bootstrap.option(ChannelOption.TCP_NODELAY,true);
+        bootstrap.handler(new ZKClientInitialzer());
 
         connectFuture = bootstrap.connect(addr);
         connectFuture.addListener(new ChannelFutureListener() {
@@ -124,11 +122,11 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
                 connectLock.lock();
                 try {
                     if (!channelFuture.isSuccess() || connectFuture == null) {
-                        LOG.info("future isn't success, cause: {}", channelFuture.getCause());
+                        LOG.info("future isn't success, cause: {}", channelFuture.cause());
                         return;
                     }
                     // setup channel, variables, connection, etc.
-                    channel = channelFuture.getChannel();
+                    channel = channelFuture.channel();
 
                     disconnected.set(false);
                     initialized = false;
@@ -150,7 +148,7 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
                     // we need to wake up on first connect to avoid timeout.
                     wakeupCnxn();
                     firstConnect.countDown();
-                    LOG.info("channel is connected: {}", channelFuture.getChannel());
+                    LOG.info("channel is connected: {}", channelFuture.channel());
                 } finally {
                     connectLock.unlock();
                 }
@@ -163,7 +161,7 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
         connectLock.lock();
         try {
             if (connectFuture != null) {
-                connectFuture.cancel();
+                connectFuture.cancel(true);
                 connectFuture = null;
             }
             if (channel != null) {
@@ -184,7 +182,7 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
 
     @Override
     void close() {
-        channelFactory.releaseExternalResources();
+        workerGroup.shutdownGracefully();
     }
 
     @Override
@@ -267,7 +265,7 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
         p.createBB();
         updateLastSend();
         sentCount++;
-        channel.write(ChannelBuffers.wrappedBuffer(p.bb));
+        channel.write(Unpooled.wrappedBuffer(p.bb));
     }
 
     private void sendPrimePacket() {
@@ -310,13 +308,13 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
     @Override
     SocketAddress getRemoteSocketAddress() {
         Channel copiedChanRef = channel;
-        return (copiedChanRef == null) ? null : copiedChanRef.getRemoteAddress();
+        return (copiedChanRef == null) ? null : copiedChanRef.remoteAddress();
     }
 
     @Override
     SocketAddress getLocalSocketAddress() {
         Channel copiedChanRef = channel;
-        return (copiedChanRef == null) ? null : copiedChanRef.getLocalAddress();
+        return (copiedChanRef == null) ? null : copiedChanRef.localAddress();
     }
 
     @Override
@@ -342,10 +340,10 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
     }
 
     /**
-     * ZKClientPipelineFactory is the netty pipeline factory for this netty
+     * ZKClientInitialzer is the netty pipeline factory for this netty
      * connection implementation.
      */
-    private class ZKClientPipelineFactory implements ChannelPipelineFactory {
+    private class ZKClientInitialzer extends ChannelInitializer<Channel> {
         private SSLContext sslContext = null;
         private SSLEngine sslEngine = null;
         private String host;
@@ -357,13 +355,12 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
         }
 
         @Override
-        public ChannelPipeline getPipeline() throws Exception {
-            ChannelPipeline pipeline = Channels.pipeline();
-            if (clientConfig.getBoolean(ZKClientConfig.SECURE_CLIENT)) {
+        public void initChannel(Channel ch) throws Exception {
+            ChannelPipeline pipeline = ch.pipeline();
+            if (Boolean.getBoolean(ZooKeeper.SECURE_CLIENT)) {
                 initSSL(pipeline);
             }
             pipeline.addLast("handler", new ZKClientHandler());
-            return pipeline;
         }
 
         // The synchronized is to prevent the race on shared variable "sslEngine".
@@ -375,7 +372,7 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
                 sslEngine.setUseClientMode(true);
             }
             pipeline.addLast("ssl", new SslHandler(sslEngine));
-            LOG.info("SSL handler added for channel: {}", pipeline.getChannel());
+            LOG.info("SSL handler added for channel: {}", pipeline.channel());
         }
     }
 
@@ -383,13 +380,12 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
      * ZKClientHandler is the netty handler that sits in netty upstream last
      * place. It mainly handles read traffic and helps synchronize connection state.
      */
-    private class ZKClientHandler extends SimpleChannelUpstreamHandler {
+    private class ZKClientHandler extends ChannelInboundHandlerAdapter {
         AtomicBoolean channelClosed = new AtomicBoolean(false);
 
         @Override
-        public void channelDisconnected(ChannelHandlerContext ctx,
-                                        ChannelStateEvent e) throws Exception {
-            LOG.info("channel is disconnected: {}", ctx.getChannel());
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+            LOG.info("channel is inactive: {}", ctx.channel());
             cleanup();
         }
 
@@ -406,11 +402,11 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
         }
 
         @Override
-        public void messageReceived(ChannelHandlerContext ctx,
-                                    MessageEvent e) throws Exception {
+        public void channelRead(ChannelHandlerContext ctx,
+                                Object msg) throws Exception {
             updateNow();
-            ChannelBuffer buf = (ChannelBuffer) e.getMessage();
-            while (buf.readable()) {
+            ByteBuf buf = (ByteBuf) msg;
+            while (buf.isReadable()) {
                 if (incomingBuffer.remaining() > buf.readableBytes()) {
                     int newLimit = incomingBuffer.position()
                             + buf.readableBytes();
@@ -443,8 +439,8 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
 
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx,
-                                    ExceptionEvent e) throws Exception {
-            LOG.warn("Exception caught: {}", e, e.getCause());
+                                    Throwable cause) throws Exception {
+            LOG.warn("Exception caught: {}", cause, cause.getCause());
             cleanup();
         }
     }
